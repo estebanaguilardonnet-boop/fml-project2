@@ -181,7 +181,7 @@ all_market_calculated_data[market] = perform_calculations(df_wrds.copy())
 print(f"Calculations applied to {market} data.")
 display(all_market_calculated_data[market].head())
 
-output_csv_file_path = '/content/USA_calculated_data.csv'
+output_csv_file_path = '/content/USA_clean.csv'
 
 # Get the calculated data for the market
 calculated_df = all_market_calculated_data[market]
