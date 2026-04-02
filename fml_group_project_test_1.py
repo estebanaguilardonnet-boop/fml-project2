@@ -116,35 +116,3 @@ chars = pd.read_excel('https://raw.githubusercontent.com/bkelly-lab/jkp-data/mai
 chars_rel = chars[chars['abr_jkp'].notna()]['abr_jkp'].tolist()
 
 wrds_db.describe_table(library="contrib", table="global_factor")
-
-market = "Denmark"
-excntry_code = MARKET_TO_EXCNTRY[market]
-start_date, end_date = MARKET_PERIODS[market]
-
-# Combine existing and new variables, removing duplicates
-selected_columns = [
-    "id", "eom", "excntry", "gvkey", "permno", "size_grp", "me", "ret_exc_lead1m",
-    "taccruals_at", "nwc_at", "taccruals_ni", "at_gr1", "be_gr1a", "debtlt_gr1a",
-    "sale_gr1", "be_me", "fcf_me", "ni_me", "sale_me", "div1m_me", "ocf_debt",
-    "at_be", "ni_be", "ret_12_1", "ret_6_1", "ret_1_0", "turnover_126d",
-    "dolvol", "dolvol_var_126d", "turnover_var_126d", "ami_126d", "rvol_21d",
-    "rmax1_21d", "sales", "prc","ff49","cash_conversion","cash_me","naics","sic","gics"
-]
-unique_selected_columns = ", ".join(sorted(list(set(selected_columns))))
-
-sql_query = f"""
-    SELECT {unique_selected_columns}
-    FROM contrib.global_factor
-    WHERE common=1 and exch_main=1 and primary_sec=1 and obs_main=1 and
-    excntry='{excntry_code}' AND eom >= '{start_date}' AND eom <= '{end_date}'
-"""
-
-print(f"Fetching data for {market} ({excntry_code}) from {start_date} to {end_date}...")
-data = wrds_db.raw_sql(sql_query)
-print("Data fetching complete.")
-
-data.to_csv('global_factor_denmark.csv', index=False)
-print('Data successfully saved to global_factor_denmark.csv')
-
-from google.colab import files
-files.download('global_factor_denmark.csv')
