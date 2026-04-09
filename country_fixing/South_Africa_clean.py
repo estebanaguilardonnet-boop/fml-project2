@@ -1,0 +1,350 @@
+all_market_raw_data = {}
+all_market_calculated_data = {}
+
+market = "South_Africa"
+excntry_code = MARKET_TO_EXCNTRY[market]
+start_date, end_date = MARKET_PERIODS[market]
+
+# Combine existing and new variables, removing duplicates
+selected_columns = [
+    "id", "eom", "excntry", "gvkey", "permno", "me", "ret_exc_lead1m",
+    "taccruals_at", "nwc_gr1a", "taccruals_ni", "at_gr1", "be_gr1a", "debtlt_gr1a",
+    "sale_gr1", "be_me", "fcf_me", "ni_me", "sale_me", "div1m_me", "ocf_debt",
+    "at_be", "ni_be", "ret_12_1", "ret_6_1", "ret_1_0", "turnover_126d",
+    "dolvol", "dolvol_var_126d", "turnover_var_126d", "ami_126d", "rvol_21d",
+    "rmax1_21d", "sales", "prc","ff49","cash_conversion","cash_me","ebit_sale","dp_gr1a"
+]
+unique_selected_columns = ", ".join(sorted(list(set(selected_columns))))
+
+sql_query = f"""
+    SELECT {unique_selected_columns}
+    FROM contrib.global_factor
+    WHERE common=1 and exch_main=1 and primary_sec=1 and obs_main=1 and
+    excntry='{excntry_code}' AND eom >= '{start_date}' AND eom <= '{end_date}'
+"""
+
+print(f"Fetching data for {market} ({excntry_code}) from {start_date} to {end_date}...")
+data = wrds_db.raw_sql(sql_query)
+print("Data fetching complete.")
+
+# Ensure 'eom' is datetime for sorting and calculations
+data['eom'] = pd.to_datetime(data['eom'])
+
+# Sort by 'id' and 'eom' to ensure correct shifting for time-series data
+data = data.sort_values(by=['id', 'eom'])
+
+# Calculate monthly return = log(prc current month / prc last month)
+data['prc_last_month'] = data.groupby('id')['prc'].shift(1)
+condition_monthly_return = (data['prc'].notna()) & (data['prc_last_month'].notna()) & (data['prc_last_month'] > 0)
+data['monthly_return'] = np.where(
+    condition_monthly_return,
+    np.log(data['prc'] / data['prc_last_month']),
+    np.nan
+)
+data = data.drop(columns=['prc_last_month']) # Drop temporary column
+
+all_market_raw_data[market] = data
+
+# The data will be saved to CSV later after all cleaning and calculations in PQG5QVOLRmzg
+# data.to_csv('Singapore.csv', index=False)
+print('Raw data with monthly return calculated and stored.')
+
+from scipy.stats.mstats import winsorize
+
+def clean_and_winsorize_monthly_return(df):
+    """Applies winsorization and filtering to the DataFrame based on monthly_return data."""
+    print("Applying winsorization and filtering to monthly_return...")
+
+    # Ensure 'eom' is datetime for sorting
+    df['eom'] = pd.to_datetime(df['eom'])
+
+    # Sort by 'id' and 'eom' for correct shifting operations
+    df = df.sort_values(by=['id', 'eom']).copy()
+
+    # Step 1: Remove zero monthly returns
+    df = df[df['monthly_return'] != 0].copy()
+
+    # Step 2: Remove monthly returns > 300% and reversed within 1 month
+    # Calculate next month's return for each 'id'
+    df['monthly_return_next'] = df.groupby('id')['monthly_return'].shift(-1)
+
+    # Identify rows where current monthly_return > 300% (3.0) and next monthly_return is negative
+    condition_to_remove = (df['monthly_return'] > 3.0) & (df['monthly_return_next'] < 0)
+
+    # Remove these rows
+    df = df[~condition_to_remove].copy()
+
+    # Drop the temporary column
+    df = df.drop(columns=['monthly_return_next'])
+
+    # Step 3: Winsorize raw monthly_returns at the top and bottom 2.5% in each exchange in each month
+    # Use transform to apply winsorization within each group
+    df['monthly_return'] = df.groupby(['excntry', 'eom'])['monthly_return'].transform(
+        lambda x: pd.Series(
+            winsorize(x.dropna(), limits=(0.025, 0.025)).data,
+            index=x.dropna().index
+        ).reindex(x.index)
+        if not x.dropna().empty else x
+    )
+
+    print("Winsorization and filtering of monthly_return complete.")
+    return df
+
+print(f"Applying cleaning and winsorization to monthly_return for {market}...")
+all_market_raw_data[market] = clean_and_winsorize_monthly_return(all_market_raw_data[market].copy()) # Apply to monthly_return
+display(all_market_raw_data[market].head())
+
+def perform_calculations(df):
+    """Performs 'cash', 'sale_to_cash', 'log_me', 'sale_to_price', 'change_mom_6', 'industry_sale', 'firm_market_share', 'hhi', 'industry_avg_be_me', 'industry_adjusted_be_me', 'industry_avg_fcf_me', 'industry_adjusted_fcf_me', 'industry_avg_me', 'industry_adjusted_me', 'industry_ew_mom_12_1', and 'industry_adjusted_change_profit_margin' calculations on a DataFrame."""
+
+    # Identify columns to exclude from median imputation
+    exclude_impute_cols = ['monthly_return'] # Exclude 'monthly_return' from imputation
+
+    # Impute missing numeric values with the median for initial columns
+    print("Imputing missing numeric values with the median for initial columns...")
+    for col in df.select_dtypes(include=np.number).columns:
+        if col not in exclude_impute_cols and df[col].isnull().any():
+            median_val = df[col].median()
+            df[col] = df[col].fillna(median_val)
+    print("Initial imputation complete.")
+
+    # Calculate cash
+    # This will correctly propagate NA/NaN if cash_me or me are NA/NaN
+    df['cash'] = df['cash_me'] * df['me']
+
+    # Calculate Sale to cash
+    # Explicitly check for non-NA values before applying numerical conditions
+    condition_sale_to_cash = (df['sales'].notna()) & \
+                             (df['me'].notna()) & \
+                             (df['sales'] != 0) & \
+                             (df['me'] != 0)
+    df['salecash'] = np.where(
+        condition_sale_to_cash,
+        df['sales']/df['cash'],
+        np.nan
+    )
+
+    # Calculate Log(market equity)
+    # Explicitly check for non-NA values before applying numerical conditions
+    condition_log_me = (df['me'].notna()) & (df['me'] > 0)
+    df['mvel1'] = np.where(
+        condition_log_me,
+        np.log(df['me']),
+        np.nan
+    )
+
+    # Calculate Sale to price
+    # Explicitly check for non-NA values before applying numerical conditions
+    condition_sale_to_price = (df['prc'].notna()) & \
+                              (df['sales'].notna()) & \
+                              (df['prc'] != 0)
+    df['sp'] = np.where(
+        condition_sale_to_price,
+        df['sales'] / df['prc'],
+        np.nan
+    )
+
+    # Sort by 'id' and 'eom' to ensure correct shifting for time-series data
+    df = df.sort_values(by=['id', 'eom'])
+
+    # Calculate Change in 6-month momentum (change_mom_6)
+    df['ret_6_1_prev_month'] = df.groupby('id')['ret_6_1'].shift(1)
+    df['chmom_6'] = df['ret_6_1'] - df['ret_6_1_prev_month']
+    df = df.drop(columns=['ret_6_1_prev_month']) # Drop temporary column
+
+    # Calculate Industry Sale
+    df['industry_sale'] = df.groupby(['eom', 'ff49'])['sales'].transform('sum')
+
+    # Calculate Firm Market Share
+    condition_firm_market_share = (df['sales'].notna()) & \
+                                  (df['industry_sale'].notna()) & \
+                                  (df['industry_sale'] != 0)
+    df['firm_market_share'] = np.where(
+        condition_firm_market_share,
+        df['sales'] / df['industry_sale'],
+        np.nan
+    )
+
+    # Calculate Herfindahl-Hirschman Index (HHI)
+    # Square the firm market share
+    df['firm_market_share_sq'] = df['firm_market_share'] ** 2
+    # Sum the squared market shares by industry and month
+    df['herf'] = df.groupby(['eom', 'ff49'])['firm_market_share_sq'].transform('sum')
+    # Drop temporary column
+    df = df.drop(columns=['firm_market_share_sq'])
+
+    # Calculate Industry Average Book-to-Market (be_me)
+    df['industry_avg_be_me'] = df.groupby(['eom', 'ff49'])['be_me'].transform('mean')
+
+    # Calculate Industry-adjusted B/M
+    condition_ind_adj_bm = (df['be_me'].notna()) & (df['industry_avg_be_me'].notna())
+    df['bm_ia'] = np.where(
+        condition_ind_adj_bm,
+        df['be_me'] - df['industry_avg_be_me'],
+        np.nan
+    )
+
+    # Calculate Industry Average CF to price ratio (fcf_me)
+    df['industry_avg_fcf_me'] = df.groupby(['eom', 'ff49'])['fcf_me'].transform('mean')
+
+    # Calculate Industry-adjusted CF to price ratio (fcf_me)
+    condition_ind_adj_fcf_me = (df['fcf_me'].notna()) & (df['industry_avg_fcf_me'].notna())
+    df['cfp_ia'] = np.where(
+        condition_ind_adj_fcf_me,
+        df['fcf_me'] - df['industry_avg_fcf_me'],
+        np.nan
+    )
+
+    # Calculate Industry Average Size (me)
+    df['industry_avg_me'] = df.groupby(['eom', 'ff49'])['me'].transform('mean')
+
+    # Calculate Industry-adjusted Size (me)
+    condition_ind_adj_me = (df['me'].notna()) & (df['industry_avg_me'].notna())
+    df['mve_ia'] = np.where(
+        condition_ind_adj_me,
+        df['me'] - df['industry_avg_me'],
+        np.nan
+    )
+
+    # Calculate Industry 12-month equal weighted momentum (ret_12_1)
+    df['indmom_a_12'] = df.groupby(['eom', 'ff49'])['ret_12_1'].transform('mean')
+
+    # Calculate firm specific change in profit margin (ebit_sale)
+    df['ebit_sale_prev_month'] = df.groupby('id')['ebit_sale'].shift(1)
+    condition_firm_change_pm = (df['ebit_sale'].notna()) & (df['ebit_sale_prev_month'].notna())
+    df['firm_change_profit_margin'] = np.where(
+        condition_firm_change_pm,
+        df['ebit_sale'] - df['ebit_sale_prev_month'],
+        np.nan
+    )
+    df = df.drop(columns=['ebit_sale_prev_month']) # Drop temporary column
+
+    # Calculate industry average change in profit margin
+    df['industry_avg_change_profit_margin'] = df.groupby(['eom', 'ff49'])['firm_change_profit_margin'].transform('mean')
+
+    # Calculate Industry-adjusted change in profit margin
+    condition_ind_adj_change_pm = (df['firm_change_profit_margin'].notna()) & (df['industry_avg_change_profit_margin'].notna())
+    df['chpmia'] = np.where(
+        condition_ind_adj_change_pm,
+        df['firm_change_profit_margin'] - df['industry_avg_change_profit_margin'],
+        np.nan
+    )
+
+    # Replace inf values with NaN for all numeric columns after calculations
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    print("Replaced inf/-inf with NaN after calculations.")
+
+    # Final imputation for all numeric columns (including newly created ones) with the median
+    print("Performing final imputation for all numeric columns...")
+    for col in df.select_dtypes(include=np.number).columns:
+        if col not in exclude_impute_cols and df[col].isnull().any():
+            median_val = df[col].median()
+            df[col] = df[col].fillna(median_val)
+    print("Final imputation complete.")
+
+    return df
+
+print(f"Applying calculations to {market} data...")
+all_market_calculated_data[market] = perform_calculations(all_market_raw_data[market].copy())
+print(f"Calculations applied to {market} data.")
+display(all_market_calculated_data[market].head())
+
+from sklearn.preprocessing import StandardScaler
+
+def normalize_characteristics(df):
+    """Normalizes all stock characteristics to zero mean and unit standard deviation by month and market.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing calculated stock characteristics.
+
+    Returns:
+        pd.DataFrame: DataFrame with normalized characteristics.
+    """
+    print("Normalizing stock characteristics by month and market...")
+
+    # Identify columns to exclude from normalization
+    # These are typically identifiers, dates, or the target variable
+    exclude_cols = ['id', 'DATE', 'excntry', 'gvkey', 'permno', 'size_grp', 'ret_exc_lead1m', 'ff49', 'naics', 'sic', 'gics']
+
+    # Dynamically select numeric columns that are not in the exclude list
+    df_normalized = df.copy()
+    numeric_cols = df_normalized.select_dtypes(include=np.number).columns.tolist()
+
+    characteristics_to_normalize = [col for col in numeric_cols if col not in exclude_cols]
+
+    if not characteristics_to_normalize:
+        print("No numeric characteristics found for normalization after excluding specified columns.")
+        return df
+
+    # Replace inf values with NaN to avoid StandardScaler error
+    df_normalized.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # Apply StandardScaler within each 'DATE' and 'excntry' group
+    def scale_group(group):
+        scaler = StandardScaler()
+        # Ensure there are non-NaN values to scale
+        if not group[characteristics_to_normalize].dropna().empty:
+            group[characteristics_to_normalize] = scaler.fit_transform(group[characteristics_to_normalize])
+        return group
+
+    df_normalized = df_normalized.groupby(['DATE', 'excntry'], group_keys=False).apply(scale_group)
+
+    print("Normalization complete.")
+    return df_normalized
+
+output_csv_file_path = f'/content/{market}_clean.csv'
+
+# Get the calculated data for the market
+calculated_df = all_market_calculated_data[market]
+
+# renaming to fit convention
+calculated_df = calculated_df.rename(columns={'ret_1_0': 'mom_1', 'eom': 'DATE','ret_6_1':'mom_6','ret_12_1':'mom_12','rmax1_21d':'maxret','rvol_21d':'retvol','fcf_me':'cfp','turnover_126d':'turn','be_me':'bm','ni_me':'ep','at_be':'lev','taccruals_ni':'pctacc','dolvol_var_126d':'stddolvol','turnover_var_126d':'stdturn','div1m_me':'dy','ami_126d':'ill','cash_conversion':'cashpr','dp_gr1a':'depr','nwc_gr1a':'acc','taccruals_at':'absacc','ni_be':'roe','be_gr1a':'egr','at_gr1':'agr','ocf_debt':'cashdebt','debtlt_gr1a':'lgr','sale_gr1':'sgr', 'ret_exc_lead1m': 'TARGET'})
+
+# Apply normalization to the calculated data BEFORE saving
+print(f"Applying normalization to {market} data...")
+calculated_df = normalize_characteristics(calculated_df)
+print(f"Normalization applied to {market} data.")
+
+# Debugging step: Check NaNs before dropping
+print("\n--- NaN counts before final dropna ---")
+print(calculated_df.isnull().sum().to_string())
+print(f"Shape of DataFrame before dropping NaN (after normalization): {calculated_df.shape}")
+print("\n--- Dtypes of DataFrame before final dropna ---\n")
+print(calculated_df.dtypes.to_string())
+
+# Fill NaN values in 'permno' with 0, as requested by the user
+if 'permno' in calculated_df.columns:
+    permno_nan_count = calculated_df['permno'].isnull().sum()
+    if permno_nan_count > 0:
+        print(f"Column 'permno' has {permno_nan_count} NaN values. Converting to numeric and filling with 0.")
+        # Convert 'permno' to a numeric type that can handle NaNs before filling
+        calculated_df['permno'] = pd.to_numeric(calculated_df['permno'], errors='coerce')
+        calculated_df['permno'] = calculated_df['permno'].fillna(0)
+
+# Drop rows with any remaining NaN values AFTER permno imputation
+calculated_df = calculated_df.dropna()
+print(f"Shape of DataFrame after dropping NaN: {calculated_df.shape}")
+
+# Define columns to be removed for the final CSV
+columns_to_remove = ['gvkey', 'permno', 'cash_me', 'ebit_sale', 'me', 'prc', 'sale_me', 'sales', 'size_grp', 'monthly_return', 'cash','industry_sale','industry_avg_be_me','firm_market_share','industry_avg_fcf_me','industry_avg_me','firm_change_profit_margin','industry_avg_change_profit_margin',]
+
+# Remove specified columns
+calculated_df = calculated_df.drop(columns=columns_to_remove, errors='ignore') # Use errors='ignore' to prevent error if a column is already missing
+
+# Reorder columns
+print("Reordering columns...")
+# Update first_cols after dropping 'gvkey' and 'permno'
+first_cols = ["id", "DATE", "excntry", "ff49"]
+other_cols = [col for col in calculated_df.columns if col not in first_cols]
+calculated_df = calculated_df[first_cols + other_cols]
+print("Columns reordered.")
+
+# Save the DataFrame to a CSV file
+calculated_df.to_csv(output_csv_file_path, index=False)
+
+print(f"Calculated data for {market} saved to {output_csv_file_path}")
+
+# You can then download this file from the Colab files pane (folder icon on the left).
+# Alternatively, you can use the following code to trigger a download:
+# from google.colab import files
+# files.download(output_csv_file_path)
