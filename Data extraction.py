@@ -10,7 +10,7 @@ from pathlib import Path
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-MARKET = "USA"
+MARKET = "market" #change this to specify the country data you want to download
 
 MARKET_PERIODS = {
     "USA": ("1963-01-01", "2017-12-31", "USA"),
